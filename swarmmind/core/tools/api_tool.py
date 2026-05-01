@@ -14,7 +14,7 @@ from .base import swarmmind_tool
 
 
 def _validate_url(url: str) -> tuple[bool, str]:
-    """验证 URL 安全性"""
+    """基础 URL 校验（不限制内网访问）"""
     # 检查协议
     if not url.startswith(("http://", "https://")):
         return False, "URL 必须以 http:// 或 https:// 开头"
