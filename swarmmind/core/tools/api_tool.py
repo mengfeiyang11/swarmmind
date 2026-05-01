@@ -9,60 +9,8 @@ SwarmMind API 调用工具
 
 import json
 import re
-import ipaddress
-import socket
 from typing import Dict, Any, Optional, List
 from .base import swarmmind_tool
-
-
-def _is_private_url(url: str) -> bool:
-    """检查是否为内网地址（增强版：覆盖 IPv4/IPv6/特殊表示）"""
-    # 提取主机名
-    host_match = re.search(r"https?://([^/:]+)", url)
-    if not host_match:
-        return False
-
-    host = host_match.group(1)
-
-    # 去掉 IPv6 方括号
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-
-    # 检查 localhost 变体
-    if host.lower() in ("localhost", "localhost.localdomain"):
-        return True
-
-    # 尝试直接解析为 IP 地址
-    try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return True
-        # IPv4-mapped IPv6 (如 ::ffff:127.0.0.1)
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            if ip.ipv4_mapped.is_private or ip.ipv4_mapped.is_loopback:
-                return True
-        return False
-    except ValueError:
-        pass
-
-    # 非 IP 格式的主机名，通过 DNS 解析检查
-    try:
-        resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        for _family, _, _, _, sockaddr in resolved:
-            addr_str = sockaddr[0]
-            try:
-                ip = ipaddress.ip_address(addr_str)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                    return True
-                if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-                    if ip.ipv4_mapped.is_private or ip.ipv4_mapped.is_loopback:
-                        return True
-            except ValueError:
-                continue
-    except (socket.gaierror, OSError):
-        pass
-
-    return False
 
 
 def _validate_url(url: str) -> tuple[bool, str]:
@@ -70,10 +18,6 @@ def _validate_url(url: str) -> tuple[bool, str]:
     # 检查协议
     if not url.startswith(("http://", "https://")):
         return False, "URL 必须以 http:// 或 https:// 开头"
-
-    # 检查内网地址（包括 DNS 解析检查）
-    if _is_private_url(url):
-        return False, "禁止访问内网地址"
 
     # 检查危险协议
     dangerous_protocols = ["file://", "ftp://", "javascript:", "data:"]
