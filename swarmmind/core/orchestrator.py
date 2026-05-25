@@ -13,6 +13,7 @@ SwarmMind 多 Agent 编排器
 import asyncio
 import time
 from typing import AsyncIterator, Optional, Any, List, Dict
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from rich.console import Console
 from rich.panel import Panel
 
@@ -22,6 +23,7 @@ from .security import SafetyChecker, ConfirmProtocol
 from .config import MEMORY_DIR
 from .experience import ExperienceStore
 from .anomaly import BehaviorMonitor, AnomalySeverity, RecommendedAction
+from .compressor import ContextCompressor
 
 console = Console()
 
@@ -77,6 +79,8 @@ class SafeOrchestrator:
         self.reviewer = ReviewerAgent(provider_name, model_name)
 
         self.summary = ""
+        self._conversation_messages: List[BaseMessage] = []
+        self._compressor = ContextCompressor(self.planner.llm)
 
     async def run(self, user_input: str) -> str:
         """完整执行流程"""
@@ -85,7 +89,7 @@ class SafeOrchestrator:
 
         # Step 1: Planner 分析
         console.print("[bold yellow][Planner] Analyzing task...[/bold yellow]")
-        plan = await self.planner.run(user_input)
+        plan = await self.planner.run(user_input, context_summary=self.summary)
 
         console.print(Panel(
             f"[bold]Analysis:[/bold] {plan.analysis[:300]}...\n"
@@ -99,6 +103,7 @@ class SafeOrchestrator:
         if not plan.actions or all(a.get("tool") in ["direct_response", "none", ""] for a in plan.actions):
             # 直接返回分析结果
             console.print("[bold green][Info] Direct response - no tool execution needed[/bold green]")
+            self._record_interaction(user_input, plan.analysis)
             return plan.analysis
 
         # Step 3: 安全检查
@@ -107,7 +112,9 @@ class SafeOrchestrator:
 
         if not confirmed_actions:
             console.print("[bold red]Task blocked by security protocol[/bold red]")
-            return "Task blocked by security protocol"
+            blocked_message = "Task blocked by security protocol"
+            self._record_interaction(user_input, blocked_message)
+            return blocked_message
 
         # Step 4: 异常行为检测
         if self.enable_anomaly_detection and self.behavior_monitor:
@@ -119,7 +126,9 @@ class SafeOrchestrator:
                 )
                 if anomaly_report.is_anomaly and anomaly_report.recommended_action == RecommendedAction.BLOCK:
                     console.print(f"[bold red]Anomaly detected: {anomaly_report.description}[/bold red]")
-                    return f"Task blocked by anomaly detection: {anomaly_report.description}"
+                    blocked_message = f"Task blocked by anomaly detection: {anomaly_report.description}"
+                    self._record_interaction(user_input, blocked_message)
+                    return blocked_message
 
         # Step 5: Executor 执行（支持并行）
         console.print("[bold green][Executor] Executing task...[/bold green]")
@@ -175,6 +184,7 @@ class SafeOrchestrator:
             review_passed=review.passed
         )
 
+        self._record_interaction(user_input, str(result))
         return result
 
     async def _execute_parallel(self, plan: dict, parallel_groups: List[List[Dict]]) -> str:
@@ -238,7 +248,7 @@ class SafeOrchestrator:
 
         # Step 1: Planner 分析（包含向量检索）
         yield "\n[Planner] Analyzing...\n\n"
-        plan = await self.planner.run(user_input)
+        plan = await self.planner.run(user_input, context_summary=self.summary)
 
         # 输出经验检索状态（通过 planner 实例获取）
         exp_info = getattr(self.planner, '_last_experience_info', '')
@@ -254,7 +264,9 @@ class SafeOrchestrator:
             confirmed = await self._safety_check(plan)
 
             if not confirmed:
-                yield "\nTask blocked by security protocol\n"
+                blocked_message = "Task blocked by security protocol"
+                yield f"\n{blocked_message}\n"
+                self._record_interaction(user_input, blocked_message)
                 return
 
             yield "[Executor] Running...\n\n"
@@ -289,6 +301,9 @@ class SafeOrchestrator:
                     duration_seconds=duration
                 )
                 yield f"\n\n[dim][Experience] Recorded (duration: {duration:.2f}s)[/dim]"
+            self._record_interaction(user_input, result_text)
+        else:
+            self._record_interaction(user_input, plan.analysis)
 
     async def _safety_check(self, plan: Any) -> Optional[dict]:
         """
@@ -374,3 +389,37 @@ class SafeOrchestrator:
             return response in ["y", "yes"]
         except (EOFError, KeyboardInterrupt):
             return False
+
+    def _record_interaction(self, user_input: str, result_text: str) -> None:
+        """记录对话并在需要时更新摘要"""
+        if not result_text:
+            return
+
+        self._conversation_messages.append(HumanMessage(content=user_input))
+        self._conversation_messages.append(AIMessage(content=result_text))
+
+        if not self._compressor.needs_compression(self._conversation_messages):
+            return
+
+        compressed = self._compressor.compress_sync(
+            self._conversation_messages,
+            existing_summary=self.summary
+        )
+        summary_text = self._extract_summary(compressed)
+        if summary_text:
+            self.summary = summary_text
+
+        self._conversation_messages = [
+            msg for msg in compressed if not isinstance(msg, SystemMessage)
+        ]
+
+    @staticmethod
+    def _extract_summary(messages: List[BaseMessage]) -> str:
+        for msg in messages:
+            if (
+                isinstance(msg, SystemMessage)
+                and isinstance(msg.content, str)
+                and msg.content.startswith("[历史对话摘要]")
+            ):
+                return msg.content.replace("[历史对话摘要]\n", "").strip()
+        return ""
