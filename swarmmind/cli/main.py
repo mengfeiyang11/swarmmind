@@ -54,7 +54,8 @@ def render_help():
         "- [cyan]exit[/cyan] / [cyan]quit[/cyan] - Exit\n"
         "- [cyan]help[/cyan] - Show help\n"
         "- [cyan]status[/cyan] - Show system status\n"
-        "- [cyan]memory[/cyan] - Show user profile\n\n"
+        "- [cyan]memory[/cyan] - Show user profile\n"
+        "- [cyan]resume[/cyan] - Resume last checkpoint\n\n"
         "[bold]Security Tips:[/bold]\n"
         "- File operations limited to office directory\n"
         "- High-risk actions require confirmation\n"
@@ -93,12 +94,13 @@ def render_memory(memory: MemorySystem):
     ))
 
 
-async def run_streaming_response(orchestrator: SafeOrchestrator, user_input: str):
+async def run_streaming_response(orchestrator: SafeOrchestrator, user_input: str = "", resume: bool = False):
     """流式输出响应"""
     buffer = ""
+    stream = orchestrator.stream_resume() if resume else orchestrator.stream(user_input)
 
     with Live(console=console, refresh_per_second=10) as live:
-        async for chunk in orchestrator.stream(user_input):
+        async for chunk in stream:
             buffer += chunk
             live.update(Text(buffer))
 
@@ -134,6 +136,12 @@ async def main_loop():
 
             elif user_input.lower() == "memory":
                 render_memory(memory)
+
+            elif user_input.lower() == "resume":
+                try:
+                    await run_streaming_response(orchestrator, resume=True)
+                except Exception as e:
+                    console.print(f"[bold red]Error: {e}[/bold red]")
 
             else:
                 try:
