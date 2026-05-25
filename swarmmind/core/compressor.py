@@ -101,13 +101,15 @@ class ContextCompressor:
 
     async def compress(
         self,
-        messages: List[BaseMessage]
+        messages: List[BaseMessage],
+        existing_summary: str = ""
     ) -> List[BaseMessage]:
         """
         压缩消息列表
 
         参数:
         - messages: 原始消息列表
+        - existing_summary: 已有摘要（可选）
 
         返回:
         - 压缩后的消息列表
@@ -122,6 +124,8 @@ class ContextCompressor:
 
         # 构建压缩请求
         conversation_text = self.messages_to_text(old_messages)
+        if existing_summary:
+            conversation_text = f"已知历史摘要：\n{existing_summary}\n\n{conversation_text}"
         prompt = COMPRESSION_PROMPT.format(conversation=conversation_text)
 
         try:
@@ -155,7 +159,8 @@ class ContextCompressor:
 
     def compress_sync(
         self,
-        messages: List[BaseMessage]
+        messages: List[BaseMessage],
+        existing_summary: str = ""
     ) -> List[BaseMessage]:
         """同步压缩方法"""
         if not self.needs_compression(messages):
@@ -167,6 +172,8 @@ class ContextCompressor:
             return messages
 
         conversation_text = self.messages_to_text(old_messages)
+        if existing_summary:
+            conversation_text = f"已知历史摘要：\n{existing_summary}\n\n{conversation_text}"
         prompt = COMPRESSION_PROMPT.format(conversation=conversation_text)
 
         try:
@@ -200,6 +207,7 @@ class ContextCompressor:
 
 def trim_and_compress_messages(
     messages: List[BaseMessage],
+    existing_summary: str = "",
     trigger_turns: int = 10,
     keep_turns: int = 4,
     compressor: Optional[ContextCompressor] = None

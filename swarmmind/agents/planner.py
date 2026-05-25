@@ -49,7 +49,7 @@ class PlannerAgent(BaseAgent):
         ]]
         self.experience_store = experience_store
 
-    def _build_system_prompt(self, similar_experiences: str = "") -> str:
+    def _build_system_prompt(self, similar_experiences: str = "", context_summary: str = "") -> str:
         experience_section = ""
         if similar_experiences:
             experience_section = f"""
@@ -57,10 +57,17 @@ class PlannerAgent(BaseAgent):
 以下是与当前任务相似的历史执行经验，请参考：
 {similar_experiences}
 """
+        summary_section = ""
+        if context_summary:
+            summary_section = f"""
+【对话摘要】
+{context_summary}
+"""
 
         return f"""你是 SwarmMind 的规划 Agent，负责分析用户意图并制定执行计划。
 
 {experience_section}
+{summary_section}
 【核心职责】
 1. 分析用户的真实需求
 2. 对于内容创作任务，直接在 analysis 字段生成完整内容
@@ -100,7 +107,7 @@ class PlannerAgent(BaseAgent):
 - 高风险操作必须标记
 """
 
-    async def run(self, user_input: str) -> PlanResult:
+    async def run(self, user_input: str, context_summary: str = "") -> PlanResult:
         """分析用户输入，生成执行计划"""
         # 检索相似经验
         similar_experiences = ""
@@ -122,7 +129,7 @@ class PlannerAgent(BaseAgent):
             self._last_experience_info = "Experience store not enabled"
 
         messages = [
-            SystemMessage(content=self._build_system_prompt(similar_experiences)),
+            SystemMessage(content=self._build_system_prompt(similar_experiences, context_summary)),
             HumanMessage(content=f"请分析以下用户请求并制定执行计划：\n\n{user_input}")
         ]
 
@@ -171,11 +178,11 @@ class PlannerAgent(BaseAgent):
                 reasoning=""
             )
 
-    async def stream(self, user_input: str):
+    async def stream(self, user_input: str, context_summary: str = ""):
         """流式输出规划过程"""
         # 检索相似经验（流式模式暂不支持经验检索）
         messages = [
-            SystemMessage(content=self._build_system_prompt("")),
+            SystemMessage(content=self._build_system_prompt("", context_summary)),
             HumanMessage(content=f"请分析以下用户请求并制定执行计划：\n\n{user_input}")
         ]
 

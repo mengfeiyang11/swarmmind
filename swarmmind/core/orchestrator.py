@@ -11,8 +11,12 @@ SwarmMind 多 Agent 编排器
 """
 
 import asyncio
+import json
+import os
 import time
+from datetime import datetime
 from typing import AsyncIterator, Optional, Any, List, Dict
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from rich.console import Console
 from rich.panel import Panel
 
@@ -22,6 +26,7 @@ from .security import SafetyChecker, ConfirmProtocol
 from .config import MEMORY_DIR
 from .experience import ExperienceStore
 from .anomaly import BehaviorMonitor, AnomalySeverity, RecommendedAction
+from .compressor import ContextCompressor
 
 console = Console()
 
@@ -77,15 +82,20 @@ class SafeOrchestrator:
         self.reviewer = ReviewerAgent(provider_name, model_name)
 
         self.summary = ""
+        self._conversation_messages: List[BaseMessage] = []
+        self._compressor = ContextCompressor(self.planner.llm)
+        self._checkpoint_path = os.path.join(MEMORY_DIR, "checkpoint.json")
 
     async def run(self, user_input: str) -> str:
         """完整执行流程"""
         start_time = time.time()
         console.print("\n[bold cyan]=== SwarmMind Multi-Agent ====[/bold cyan]\n")
+        checkpoint = self._init_checkpoint(user_input)
 
         # Step 1: Planner 分析
         console.print("[bold yellow][Planner] Analyzing task...[/bold yellow]")
-        plan = await self.planner.run(user_input)
+        plan = await self.planner.run(user_input, context_summary=self.summary)
+        self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(plan))
 
         console.print(Panel(
             f"[bold]Analysis:[/bold] {plan.analysis[:300]}...\n"
@@ -99,6 +109,8 @@ class SafeOrchestrator:
         if not plan.actions or all(a.get("tool") in ["direct_response", "none", ""] for a in plan.actions):
             # 直接返回分析结果
             console.print("[bold green][Info] Direct response - no tool execution needed[/bold green]")
+            self._record_interaction(user_input, plan.analysis)
+            self._finalize_checkpoint(checkpoint, plan.analysis)
             return plan.analysis
 
         # Step 3: 安全检查
@@ -107,7 +119,11 @@ class SafeOrchestrator:
 
         if not confirmed_actions:
             console.print("[bold red]Task blocked by security protocol[/bold red]")
-            return "Task blocked by security protocol"
+            blocked_message = "Task blocked by security protocol"
+            self._record_interaction(user_input, blocked_message)
+            self._finalize_checkpoint(checkpoint, blocked_message)
+            return blocked_message
+        self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=confirmed_actions)
 
         # Step 4: 异常行为检测
         if self.enable_anomaly_detection and self.behavior_monitor:
@@ -119,7 +135,10 @@ class SafeOrchestrator:
                 )
                 if anomaly_report.is_anomaly and anomaly_report.recommended_action == RecommendedAction.BLOCK:
                     console.print(f"[bold red]Anomaly detected: {anomaly_report.description}[/bold red]")
-                    return f"Task blocked by anomaly detection: {anomaly_report.description}"
+                    blocked_message = f"Task blocked by anomaly detection: {anomaly_report.description}"
+                    self._record_interaction(user_input, blocked_message)
+                    self._finalize_checkpoint(checkpoint, blocked_message)
+                    return blocked_message
 
         # Step 5: Executor 执行（支持并行）
         console.print("[bold green][Executor] Executing task...[/bold green]")
@@ -131,6 +150,7 @@ class SafeOrchestrator:
             result = await self._execute_parallel(confirmed_actions, parallel_groups)
         else:
             result = await self.executor.run(confirmed_actions)
+        self._update_checkpoint(checkpoint, stage="executed", result=str(result))
 
         console.print(Panel(
             str(result)[:500],
@@ -141,6 +161,11 @@ class SafeOrchestrator:
         # Step 6: Reviewer 审查
         console.print("[bold blue][Reviewer] Checking result...[/bold blue]")
         review = await self.reviewer.run(str(result))
+        self._update_checkpoint(
+            checkpoint,
+            stage="reviewed",
+            review={"passed": review.passed, "feedback": review.feedback, "suggestions": review.suggestions}
+        )
 
         status = "PASS" if review.passed else "NEEDS IMPROVEMENT"
         console.print(Panel(
@@ -175,6 +200,8 @@ class SafeOrchestrator:
             review_passed=review.passed
         )
 
+        self._record_interaction(user_input, str(result))
+        self._finalize_checkpoint(checkpoint, str(result))
         return result
 
     async def _execute_parallel(self, plan: dict, parallel_groups: List[List[Dict]]) -> str:
@@ -235,10 +262,12 @@ class SafeOrchestrator:
     async def stream(self, user_input: str) -> AsyncIterator[str]:
         """流式执行流程"""
         start_time = time.time()
+        checkpoint = self._init_checkpoint(user_input)
 
         # Step 1: Planner 分析（包含向量检索）
         yield "\n[Planner] Analyzing...\n\n"
-        plan = await self.planner.run(user_input)
+        plan = await self.planner.run(user_input, context_summary=self.summary)
+        self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(plan))
 
         # 输出经验检索状态（通过 planner 实例获取）
         exp_info = getattr(self.planner, '_last_experience_info', '')
@@ -254,8 +283,12 @@ class SafeOrchestrator:
             confirmed = await self._safety_check(plan)
 
             if not confirmed:
-                yield "\nTask blocked by security protocol\n"
+                blocked_message = "Task blocked by security protocol"
+                yield f"\n{blocked_message}\n"
+                self._record_interaction(user_input, blocked_message)
+                self._finalize_checkpoint(checkpoint, blocked_message)
                 return
+            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=confirmed)
 
             yield "[Executor] Running...\n\n"
             result_text = ""
@@ -270,6 +303,12 @@ class SafeOrchestrator:
 
             yield "\n\n[Reviewer] Checking...\n\n"
             review = await self.reviewer.run(result_text)
+            self._update_checkpoint(
+                checkpoint,
+                stage="reviewed",
+                review={"passed": review.passed, "feedback": review.feedback, "suggestions": review.suggestions},
+                result=result_text
+            )
 
             if review.passed:
                 yield "\nReview: PASS"
@@ -289,6 +328,27 @@ class SafeOrchestrator:
                     duration_seconds=duration
                 )
                 yield f"\n\n[dim][Experience] Recorded (duration: {duration:.2f}s)[/dim]"
+            self._record_interaction(user_input, result_text)
+            self._finalize_checkpoint(checkpoint, result_text)
+        else:
+            self._record_interaction(user_input, plan.analysis)
+            self._finalize_checkpoint(checkpoint, plan.analysis)
+
+    async def resume(self) -> str:
+        """从断点续跑"""
+        checkpoint = self._load_checkpoint()
+        if not checkpoint:
+            return "No checkpoint found"
+        return await self._resume_from_checkpoint(checkpoint)
+
+    async def stream_resume(self) -> AsyncIterator[str]:
+        """流式断点续跑"""
+        checkpoint = self._load_checkpoint()
+        if not checkpoint:
+            yield "No checkpoint found"
+            return
+        async for chunk in self._stream_from_checkpoint(checkpoint):
+            yield chunk
 
     async def _safety_check(self, plan: Any) -> Optional[dict]:
         """
@@ -374,3 +434,274 @@ class SafeOrchestrator:
             return response in ["y", "yes"]
         except (EOFError, KeyboardInterrupt):
             return False
+
+    def _init_checkpoint(self, user_input: str) -> dict:
+        checkpoint = {
+            "stage": "start",
+            "user_input": user_input,
+            "summary": self.summary,
+            "plan": None,
+            "confirmed_actions": None,
+            "result": None,
+            "review": None,
+            "created_at": datetime.now().isoformat()
+        }
+        self._save_checkpoint(checkpoint)
+        return checkpoint
+
+    def _plan_to_dict(self, plan: Any) -> Dict[str, Any]:
+        data = {
+            "analysis": getattr(plan, "analysis", ""),
+            "actions": getattr(plan, "actions", []),
+            "reasoning": getattr(plan, "reasoning", "")
+        }
+        parallel_groups = getattr(plan, "parallel_groups", None)
+        if parallel_groups:
+            data["parallel_groups"] = parallel_groups
+        return data
+
+    def _build_plan(self, data: Dict[str, Any]):
+        from ..agents.planner import PlanResult
+
+        plan = PlanResult(
+            analysis=data.get("analysis", ""),
+            actions=data.get("actions", []),
+            reasoning=data.get("reasoning", "")
+        )
+        if "parallel_groups" in data:
+            setattr(plan, "parallel_groups", data.get("parallel_groups"))
+        return plan
+
+    def _save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        checkpoint["summary"] = self.summary
+        checkpoint["updated_at"] = datetime.now().isoformat()
+        os.makedirs(os.path.dirname(self._checkpoint_path), exist_ok=True)
+        with open(self._checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(checkpoint, f, ensure_ascii=False, indent=2)
+
+    def _load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(self._checkpoint_path):
+            return None
+        try:
+            with open(self._checkpoint_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Checkpoint] Load error: {e}")
+            return None
+
+    def _clear_checkpoint(self) -> None:
+        if os.path.exists(self._checkpoint_path):
+            try:
+                os.remove(self._checkpoint_path)
+            except Exception:
+                pass
+
+    def _update_checkpoint(self, checkpoint: Dict[str, Any], **updates) -> None:
+        checkpoint.update(updates)
+        self._save_checkpoint(checkpoint)
+
+    def _finalize_checkpoint(self, checkpoint: Dict[str, Any], result: str) -> None:
+        checkpoint.update({"stage": "completed", "result": result})
+        self._save_checkpoint(checkpoint)
+        self._clear_checkpoint()
+
+    def _check_anomaly_block(self, confirmed_actions: Dict[str, Any]) -> Optional[str]:
+        if not (self.enable_anomaly_detection and self.behavior_monitor):
+            return None
+
+        for action in confirmed_actions.get("actions", []):
+            anomaly_report = self.behavior_monitor.check_anomaly(
+                agent="executor",
+                tool=action.get("tool", ""),
+                args=action.get("args", {})
+            )
+            if anomaly_report.is_anomaly and anomaly_report.recommended_action == RecommendedAction.BLOCK:
+                return f"Task blocked by anomaly detection: {anomaly_report.description}"
+
+        return None
+
+    async def _resume_from_checkpoint(self, checkpoint: Dict[str, Any]) -> str:
+        stage = checkpoint.get("stage", "start")
+        user_input = checkpoint.get("user_input", "")
+        self.summary = checkpoint.get("summary", "")
+
+        if stage == "start":
+            return await self.run(user_input)
+
+        plan_data = checkpoint.get("plan") or {}
+        plan = self._build_plan(plan_data)
+
+        if not plan.actions or all(a.get("tool") in ["direct_response", "none", ""] for a in plan.actions):
+            self._record_interaction(user_input, plan.analysis)
+            self._finalize_checkpoint(checkpoint, plan.analysis)
+            return plan.analysis
+
+        confirmed_actions = checkpoint.get("confirmed_actions")
+        if stage in ["planned"] or not confirmed_actions:
+            confirmed_actions = await self._safety_check(plan)
+            if not confirmed_actions:
+                blocked_message = "Task blocked by security protocol"
+                self._record_interaction(user_input, blocked_message)
+                self._finalize_checkpoint(checkpoint, blocked_message)
+                return blocked_message
+            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=confirmed_actions)
+
+        anomaly_block = self._check_anomaly_block(confirmed_actions)
+        if anomaly_block:
+            self._record_interaction(user_input, anomaly_block)
+            self._finalize_checkpoint(checkpoint, anomaly_block)
+            return anomaly_block
+
+        result = checkpoint.get("result")
+        if stage in ["confirmed"] or result is None:
+            parallel_groups = plan_data.get("parallel_groups") or confirmed_actions.get("parallel_groups", [])
+            if self.enable_parallel and parallel_groups:
+                result = await self._execute_parallel(confirmed_actions, parallel_groups)
+            else:
+                result = await self.executor.run(confirmed_actions)
+            self._update_checkpoint(checkpoint, stage="executed", result=str(result))
+
+        review_data = checkpoint.get("review")
+        if stage in ["executed"] or not review_data:
+            review = await self.reviewer.run(str(result))
+            review_data = {
+                "passed": review.passed,
+                "feedback": review.feedback,
+                "suggestions": review.suggestions
+            }
+            self._update_checkpoint(checkpoint, stage="reviewed", review=review_data)
+
+        duration = 0.0
+        if self.enable_experience and self.experience_store:
+            await self.experience_store.record(
+                task=user_input,
+                plan={"analysis": plan.analysis, "actions": confirmed_actions.get("actions", [])},
+                result=str(result),
+                review_passed=review_data.get("passed", False),
+                review_feedback=review_data.get("feedback", ""),
+                suggestions=review_data.get("suggestions", []),
+                duration_seconds=duration
+            )
+
+        self._record_interaction(user_input, str(result))
+        self._finalize_checkpoint(checkpoint, str(result))
+        return str(result)
+
+    async def _stream_from_checkpoint(self, checkpoint: Dict[str, Any]) -> AsyncIterator[str]:
+        stage = checkpoint.get("stage", "start")
+        user_input = checkpoint.get("user_input", "")
+        self.summary = checkpoint.get("summary", "")
+
+        if stage == "start":
+            async for chunk in self.stream(user_input):
+                yield chunk
+            return
+
+        plan_data = checkpoint.get("plan") or {}
+        plan = self._build_plan(plan_data)
+
+        yield "\n[Planner] Resuming...\n\n"
+        yield plan.analysis
+
+        if not plan.actions or all(a.get("tool") in ["direct_response", "none", ""] for a in plan.actions):
+            self._record_interaction(user_input, plan.analysis)
+            self._finalize_checkpoint(checkpoint, plan.analysis)
+            return
+
+        yield "\n\n[Safety] Checking permissions...\n\n"
+        confirmed_actions = checkpoint.get("confirmed_actions")
+        if stage in ["planned"] or not confirmed_actions:
+            confirmed_actions = await self._safety_check(plan)
+            if not confirmed_actions:
+                blocked_message = "Task blocked by security protocol"
+                yield f"\n{blocked_message}\n"
+                self._record_interaction(user_input, blocked_message)
+                self._finalize_checkpoint(checkpoint, blocked_message)
+                return
+            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=confirmed_actions)
+
+        anomaly_block = self._check_anomaly_block(confirmed_actions)
+        if anomaly_block:
+            yield f"\n{anomaly_block}\n"
+            self._record_interaction(user_input, anomaly_block)
+            self._finalize_checkpoint(checkpoint, anomaly_block)
+            return
+
+        result_text = checkpoint.get("result", "")
+        if stage in ["confirmed"] or not result_text:
+            yield "[Executor] Running...\n\n"
+            first_chunk = True
+            async for chunk in self.executor.stream(confirmed_actions):
+                if first_chunk:
+                    first_chunk = False
+                    continue
+                result_text += chunk
+                yield chunk
+            self._update_checkpoint(checkpoint, stage="executed", result=result_text)
+        else:
+            yield "\n[Executor] Resumed previous result\n\n"
+            yield result_text
+
+        yield "\n\n[Reviewer] Checking...\n\n"
+        review_data = checkpoint.get("review")
+        if stage in ["executed"] or not review_data:
+            review = await self.reviewer.run(result_text)
+            review_data = {
+                "passed": review.passed,
+                "feedback": review.feedback,
+                "suggestions": review.suggestions
+            }
+            self._update_checkpoint(checkpoint, stage="reviewed", review=review_data)
+
+        if review_data.get("passed"):
+            yield "\nReview: PASS"
+        else:
+            yield f"\nReview: NEEDS IMPROVEMENT - {review_data.get('feedback', '')}"
+
+        if self.enable_experience and self.experience_store:
+            await self.experience_store.record(
+                task=user_input,
+                plan={"analysis": plan.analysis, "actions": confirmed_actions.get("actions", [])},
+                result=result_text,
+                review_passed=review_data.get("passed", False),
+                review_feedback=review_data.get("feedback", ""),
+                suggestions=review_data.get("suggestions", []),
+                duration_seconds=0.0
+            )
+
+        self._record_interaction(user_input, result_text)
+        self._finalize_checkpoint(checkpoint, result_text)
+
+    def _record_interaction(self, user_input: str, result_text: str) -> None:
+        """记录对话并在需要时更新摘要"""
+        if not result_text:
+            return
+
+        self._conversation_messages.append(HumanMessage(content=user_input))
+        self._conversation_messages.append(AIMessage(content=result_text))
+
+        if not self._compressor.needs_compression(self._conversation_messages):
+            return
+
+        compressed = self._compressor.compress_sync(
+            self._conversation_messages,
+            existing_summary=self.summary
+        )
+        summary_text = self._extract_summary(compressed)
+        if summary_text:
+            self.summary = summary_text
+
+        self._conversation_messages = [
+            msg for msg in compressed if not isinstance(msg, SystemMessage)
+        ]
+
+    @staticmethod
+    def _extract_summary(messages: List[BaseMessage]) -> str:
+        for msg in messages:
+            if (
+                isinstance(msg, SystemMessage)
+                and isinstance(msg.content, str)
+                and msg.content.startswith("[历史对话摘要]")
+            ):
+                return msg.content.replace("[历史对话摘要]\n", "").strip()
+        return ""
