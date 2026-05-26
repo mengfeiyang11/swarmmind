@@ -50,13 +50,15 @@ class SafeOrchestrator:
         model_name: str = "gpt-4o-mini",
         enable_parallel: bool = True,
         enable_experience: bool = True,
-        enable_anomaly_detection: bool = True
+        enable_anomaly_detection: bool = True,
+        max_review_retries: int = 1
     ):
         self.provider_name = provider_name
         self.model_name = model_name
         self.enable_parallel = enable_parallel
         self.enable_experience = enable_experience
         self.enable_anomaly_detection = enable_anomaly_detection
+        self.max_review_retries = max(0, max_review_retries)
 
         self.memory = MemorySystem(MEMORY_DIR)
 
@@ -158,34 +160,121 @@ class SafeOrchestrator:
             border_style="green"
         ))
 
-        # Step 6: Reviewer 审查
-        console.print("[bold blue][Reviewer] Checking result...[/bold blue]")
-        review = await self.reviewer.run(str(result))
-        self._update_checkpoint(
-            checkpoint,
-            stage="reviewed",
-            review={"passed": review.passed, "feedback": review.feedback, "suggestions": review.suggestions}
-        )
+        # Step 6: Reviewer 审查（失败则重新规划/执行）
+        review_attempts = checkpoint.get("review_attempts", 0)
+        review_data: Dict[str, Any] = {}
+        current_plan = plan
+        current_confirmed_actions = confirmed_actions
 
-        status = "PASS" if review.passed else "NEEDS IMPROVEMENT"
-        console.print(Panel(
-            f"[bold]Review:[/bold] {status}\n"
-            f"[bold]Feedback:[/bold] {review.feedback}\n"
-            f"[bold]Suggestions:[/bold] {', '.join(review.suggestions) if review.suggestions else 'None'}",
-            title="Review Result",
-            border_style="blue"
-        ))
+        while True:
+            console.print("[bold blue][Reviewer] Checking result...[/bold blue]")
+            review = await self.reviewer.run(str(result))
+            review_data = {
+                "passed": review.passed,
+                "feedback": review.feedback,
+                "suggestions": review.suggestions
+            }
+            review_attempts += 1
+            self._record_review(checkpoint, review_data, review_attempts)
+
+            status = "PASS" if review.passed else "NEEDS IMPROVEMENT"
+            console.print(Panel(
+                f"[bold]Review:[/bold] {status}\n"
+                f"[bold]Feedback:[/bold] {review.feedback}\n"
+                f"[bold]Suggestions:[/bold] {', '.join(review.suggestions) if review.suggestions else 'None'}",
+                title="Review Result",
+                border_style="blue"
+            ))
+
+            if not self._can_retry_review(review_data, review_attempts):
+                break
+
+            console.print("[bold magenta][Planner] Review failed, replanning...[/bold magenta]")
+            retry_context = self._build_review_context(
+                feedback=review.feedback,
+                suggestions=review.suggestions,
+                attempt=review_attempts,
+                result_text=str(result)
+            )
+            current_plan = await self.planner.run(
+                user_input,
+                context_summary=self._compose_context_summary(retry_context)
+            )
+            self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(current_plan))
+
+            console.print(Panel(
+                f"[bold]Analysis:[/bold] {current_plan.analysis[:300]}...\n"
+                f"[bold]Steps:[/bold] {len(current_plan.actions)}\n"
+                f"[bold]Reasoning:[/bold] {current_plan.reasoning[:200]}",
+                title="Replan Result",
+                border_style="magenta"
+            ))
+
+            if not current_plan.actions or all(
+                a.get("tool") in ["direct_response", "none", ""] for a in current_plan.actions
+            ):
+                console.print("[bold green][Info] Direct response - no tool execution needed[/bold green]")
+                result = current_plan.analysis
+                current_confirmed_actions = {
+                    "analysis": current_plan.analysis,
+                    "actions": [],
+                    "reasoning": current_plan.reasoning
+                }
+                self._update_checkpoint(
+                    checkpoint,
+                    stage="executed",
+                    result=str(result),
+                    confirmed_actions=current_confirmed_actions
+                )
+                continue
+
+            console.print("[bold red][Safety] Checking permissions...[/bold red]")
+            current_confirmed_actions = await self._safety_check(current_plan)
+
+            if not current_confirmed_actions:
+                console.print("[bold red]Task blocked by security protocol[/bold red]")
+                blocked_message = "Task blocked by security protocol"
+                self._record_interaction(user_input, blocked_message)
+                self._finalize_checkpoint(checkpoint, blocked_message)
+                return blocked_message
+            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=current_confirmed_actions)
+
+            anomaly_block = self._check_anomaly_block(current_confirmed_actions)
+            if anomaly_block:
+                console.print(f"[bold red]{anomaly_block}[/bold red]")
+                self._record_interaction(user_input, anomaly_block)
+                self._finalize_checkpoint(checkpoint, anomaly_block)
+                return anomaly_block
+
+            console.print("[bold green][Executor] Executing task...[/bold green]")
+
+            parallel_groups = getattr(current_plan, 'parallel_groups', None) or current_confirmed_actions.get("parallel_groups", [])
+
+            if self.enable_parallel and parallel_groups:
+                result = await self._execute_parallel(current_confirmed_actions, parallel_groups)
+            else:
+                result = await self.executor.run(current_confirmed_actions)
+            self._update_checkpoint(checkpoint, stage="executed", result=str(result))
+
+            console.print(Panel(
+                str(result)[:500],
+                title="Execution Result",
+                border_style="green"
+            ))
 
         # Step 7: 记录执行经验
         duration = time.time() - start_time
         if self.enable_experience and self.experience_store:
             await self.experience_store.record(
                 task=user_input,
-                plan={"analysis": plan.analysis, "actions": confirmed_actions.get("actions", [])},
+                plan={
+                    "analysis": current_plan.analysis,
+                    "actions": (current_confirmed_actions or {}).get("actions", [])
+                },
                 result=str(result),
-                review_passed=review.passed,
-                review_feedback=review.feedback,
-                suggestions=review.suggestions,
+                review_passed=review_data.get("passed", False),
+                review_feedback=review_data.get("feedback", ""),
+                suggestions=review_data.get("suggestions", []),
                 duration_seconds=duration
             )
             console.print(f"[dim][Experience] Recorded (duration: {duration:.2f}s)[/dim]")
@@ -196,8 +285,8 @@ class SafeOrchestrator:
             event="task_complete",
             agent_name="orchestrator",
             risk_level="low",
-            plan_summary=plan.analysis[:200],
-            review_passed=review.passed
+            plan_summary=current_plan.analysis[:200],
+            review_passed=review_data.get("passed", False)
         )
 
         self._record_interaction(user_input, str(result))
@@ -279,21 +368,26 @@ class SafeOrchestrator:
 
         # 如果有需要执行的工具操作
         if plan.actions:
-            yield "\n\n[Safety] Checking permissions...\n\n"
-            confirmed = await self._safety_check(plan)
+            current_plan = plan
+            current_confirmed = None
+            review_attempts = checkpoint.get("review_attempts", 0)
+            review_data: Dict[str, Any] = {}
 
-            if not confirmed:
+            yield "\n\n[Safety] Checking permissions...\n\n"
+            current_confirmed = await self._safety_check(current_plan)
+
+            if not current_confirmed:
                 blocked_message = "Task blocked by security protocol"
                 yield f"\n{blocked_message}\n"
                 self._record_interaction(user_input, blocked_message)
                 self._finalize_checkpoint(checkpoint, blocked_message)
                 return
-            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=confirmed)
+            self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=current_confirmed)
 
             yield "[Executor] Running...\n\n"
             result_text = ""
             first_chunk = True
-            async for chunk in self.executor.stream(confirmed):
+            async for chunk in self.executor.stream(current_confirmed):
                 if first_chunk:
                     # 跳过 executor 第一条重复消息（executor 第一条总是对 plan 的响应）
                     first_chunk = False
@@ -301,30 +395,100 @@ class SafeOrchestrator:
                 result_text += chunk
                 yield chunk
 
-            yield "\n\n[Reviewer] Checking...\n\n"
-            review = await self.reviewer.run(result_text)
-            self._update_checkpoint(
-                checkpoint,
-                stage="reviewed",
-                review={"passed": review.passed, "feedback": review.feedback, "suggestions": review.suggestions},
-                result=result_text
-            )
+            self._update_checkpoint(checkpoint, stage="executed", result=result_text)
 
-            if review.passed:
-                yield "\nReview: PASS"
-            else:
-                yield f"\nReview: NEEDS IMPROVEMENT - {review.feedback}"
+            while True:
+                yield "\n\n[Reviewer] Checking...\n\n"
+                review = await self.reviewer.run(result_text)
+                review_data = {
+                    "passed": review.passed,
+                    "feedback": review.feedback,
+                    "suggestions": review.suggestions
+                }
+                review_attempts += 1
+                self._record_review(checkpoint, review_data, review_attempts)
+
+                if review.passed:
+                    yield "\nReview: PASS"
+                else:
+                    yield f"\nReview: NEEDS IMPROVEMENT - {review.feedback}"
+
+                if not self._can_retry_review(review_data, review_attempts):
+                    break
+
+                yield f"\n\n[Planner] Replanning (attempt {review_attempts})...\n\n"
+                retry_context = self._build_review_context(
+                    feedback=review.feedback,
+                    suggestions=review.suggestions,
+                    attempt=review_attempts,
+                    result_text=result_text
+                )
+                current_plan = await self.planner.run(
+                    user_input,
+                    context_summary=self._compose_context_summary(retry_context)
+                )
+                self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(current_plan))
+                yield current_plan.analysis
+
+                if not current_plan.actions or all(
+                    a.get("tool") in ["direct_response", "none", ""] for a in current_plan.actions
+                ):
+                    result_text = current_plan.analysis
+                    current_confirmed = {
+                        "analysis": current_plan.analysis,
+                        "actions": [],
+                        "reasoning": current_plan.reasoning
+                    }
+                    self._update_checkpoint(
+                        checkpoint,
+                        stage="executed",
+                        result=result_text,
+                        confirmed_actions=current_confirmed
+                    )
+                    continue
+
+                yield "\n\n[Safety] Checking permissions...\n\n"
+                current_confirmed = await self._safety_check(current_plan)
+
+                if not current_confirmed:
+                    blocked_message = "Task blocked by security protocol"
+                    yield f"\n{blocked_message}\n"
+                    self._record_interaction(user_input, blocked_message)
+                    self._finalize_checkpoint(checkpoint, blocked_message)
+                    return
+                self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=current_confirmed)
+
+                anomaly_block = self._check_anomaly_block(current_confirmed)
+                if anomaly_block:
+                    yield f"\n{anomaly_block}\n"
+                    self._record_interaction(user_input, anomaly_block)
+                    self._finalize_checkpoint(checkpoint, anomaly_block)
+                    return
+
+                yield "[Executor] Running...\n\n"
+                result_text = ""
+                first_chunk = True
+                async for chunk in self.executor.stream(current_confirmed):
+                    if first_chunk:
+                        first_chunk = False
+                        continue
+                    result_text += chunk
+                    yield chunk
+                self._update_checkpoint(checkpoint, stage="executed", result=result_text)
 
             # 记录经验（流式模式）
             duration = time.time() - start_time
             if self.enable_experience and self.experience_store:
                 await self.experience_store.record(
                     task=user_input,
-                    plan={"analysis": plan.analysis, "actions": confirmed.get("actions", [])},
+                    plan={
+                        "analysis": current_plan.analysis,
+                        "actions": (current_confirmed or {}).get("actions", [])
+                    },
                     result=result_text,
-                    review_passed=review.passed,
-                    review_feedback=review.feedback,
-                    suggestions=review.suggestions,
+                    review_passed=review_data.get("passed", False),
+                    review_feedback=review_data.get("feedback", ""),
+                    suggestions=review_data.get("suggestions", []),
                     duration_seconds=duration
                 )
                 yield f"\n\n[dim][Experience] Recorded (duration: {duration:.2f}s)[/dim]"
@@ -444,6 +608,8 @@ class SafeOrchestrator:
             "confirmed_actions": None,
             "result": None,
             "review": None,
+            "review_attempts": 0,
+            "review_history": [],
             "created_at": datetime.now().isoformat()
         }
         self._save_checkpoint(checkpoint)
@@ -520,6 +686,52 @@ class SafeOrchestrator:
 
         return None
 
+    def _compose_context_summary(self, extra_context: str) -> str:
+        if self.summary and extra_context:
+            return f"{self.summary}\n\n{extra_context}"
+        return extra_context or self.summary
+
+    @staticmethod
+    def _build_review_context(feedback: str, suggestions: List[str], attempt: int, result_text: str) -> str:
+        suggestion_text = ", ".join(suggestions) if suggestions else "None"
+        result_snippet = result_text[:500] if result_text else ""
+        return (
+            "【审查未通过，需重新规划】\n"
+            f"失败次数: {attempt}\n"
+            f"反馈: {feedback}\n"
+            f"建议: {suggestion_text}\n"
+            f"执行结果摘要: {result_snippet}"
+        )
+
+    def _record_review(
+        self,
+        checkpoint: Dict[str, Any],
+        review_data: Dict[str, Any],
+        review_attempts: int
+    ) -> List[Dict[str, Any]]:
+        review_history = checkpoint.get("review_history") or []
+        review_history.append({
+            "attempt": review_attempts,
+            "passed": review_data.get("passed", False),
+            "feedback": review_data.get("feedback", ""),
+            "suggestions": review_data.get("suggestions", []),
+            "timestamp": datetime.now().isoformat()
+        })
+        self._update_checkpoint(
+            checkpoint,
+            stage="reviewed",
+            review=review_data,
+            review_attempts=review_attempts,
+            review_history=review_history
+        )
+        return review_history
+
+    def _can_retry_review(self, review_data: Dict[str, Any], review_attempts: int) -> bool:
+        return (
+            not review_data.get("passed", False)
+            and review_attempts < (1 + self.max_review_retries)
+        )
+
     async def _resume_from_checkpoint(self, checkpoint: Dict[str, Any]) -> str:
         stage = checkpoint.get("stage", "start")
         user_input = checkpoint.get("user_input", "")
@@ -561,6 +773,13 @@ class SafeOrchestrator:
                 result = await self.executor.run(confirmed_actions)
             self._update_checkpoint(checkpoint, stage="executed", result=str(result))
 
+        review_history = checkpoint.get("review_history") or []
+        review_attempts = checkpoint.get("review_attempts", 0)
+        if review_attempts == 0 and review_history:
+            review_attempts = len(review_history)
+        current_plan = plan
+        current_confirmed_actions = confirmed_actions
+
         review_data = checkpoint.get("review")
         if stage in ["executed"] or not review_data:
             review = await self.reviewer.run(str(result))
@@ -569,13 +788,79 @@ class SafeOrchestrator:
                 "feedback": review.feedback,
                 "suggestions": review.suggestions
             }
-            self._update_checkpoint(checkpoint, stage="reviewed", review=review_data)
+            review_attempts += 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
+        elif review_attempts == 0 and not review_history:
+            review_attempts = 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
+
+        while self._can_retry_review(review_data, review_attempts):
+            retry_context = self._build_review_context(
+                feedback=review_data.get("feedback", ""),
+                suggestions=review_data.get("suggestions", []),
+                attempt=review_attempts,
+                result_text=str(result)
+            )
+            current_plan = await self.planner.run(
+                user_input,
+                context_summary=self._compose_context_summary(retry_context)
+            )
+            self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(current_plan))
+
+            if not current_plan.actions or all(
+                a.get("tool") in ["direct_response", "none", ""] for a in current_plan.actions
+            ):
+                result = current_plan.analysis
+                current_confirmed_actions = {
+                    "analysis": current_plan.analysis,
+                    "actions": [],
+                    "reasoning": current_plan.reasoning
+                }
+                self._update_checkpoint(
+                    checkpoint,
+                    stage="executed",
+                    result=str(result),
+                    confirmed_actions=current_confirmed_actions
+                )
+            else:
+                current_confirmed_actions = await self._safety_check(current_plan)
+                if not current_confirmed_actions:
+                    blocked_message = "Task blocked by security protocol"
+                    self._record_interaction(user_input, blocked_message)
+                    self._finalize_checkpoint(checkpoint, blocked_message)
+                    return blocked_message
+                self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=current_confirmed_actions)
+
+                anomaly_block = self._check_anomaly_block(current_confirmed_actions)
+                if anomaly_block:
+                    self._record_interaction(user_input, anomaly_block)
+                    self._finalize_checkpoint(checkpoint, anomaly_block)
+                    return anomaly_block
+
+                parallel_groups = getattr(current_plan, 'parallel_groups', None) or current_confirmed_actions.get("parallel_groups", [])
+                if self.enable_parallel and parallel_groups:
+                    result = await self._execute_parallel(current_confirmed_actions, parallel_groups)
+                else:
+                    result = await self.executor.run(current_confirmed_actions)
+                self._update_checkpoint(checkpoint, stage="executed", result=str(result))
+
+            review = await self.reviewer.run(str(result))
+            review_data = {
+                "passed": review.passed,
+                "feedback": review.feedback,
+                "suggestions": review.suggestions
+            }
+            review_attempts += 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
 
         duration = 0.0
         if self.enable_experience and self.experience_store:
             await self.experience_store.record(
                 task=user_input,
-                plan={"analysis": plan.analysis, "actions": confirmed_actions.get("actions", [])},
+                plan={
+                    "analysis": current_plan.analysis,
+                    "actions": (current_confirmed_actions or {}).get("actions", [])
+                },
                 result=str(result),
                 review_passed=review_data.get("passed", False),
                 review_feedback=review_data.get("feedback", ""),
@@ -642,8 +927,15 @@ class SafeOrchestrator:
             yield "\n[Executor] Resumed previous result\n\n"
             yield result_text
 
-        yield "\n\n[Reviewer] Checking...\n\n"
+        current_plan = plan
+        current_confirmed_actions = confirmed_actions
+        review_history = checkpoint.get("review_history") or []
+        review_attempts = checkpoint.get("review_attempts", 0)
+        if review_attempts == 0 and review_history:
+            review_attempts = len(review_history)
         review_data = checkpoint.get("review")
+
+        yield "\n\n[Reviewer] Checking...\n\n"
         if stage in ["executed"] or not review_data:
             review = await self.reviewer.run(result_text)
             review_data = {
@@ -651,17 +943,98 @@ class SafeOrchestrator:
                 "feedback": review.feedback,
                 "suggestions": review.suggestions
             }
-            self._update_checkpoint(checkpoint, stage="reviewed", review=review_data)
+            review_attempts += 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
+        elif review_attempts == 0 and not review_history:
+            review_attempts = 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
 
         if review_data.get("passed"):
             yield "\nReview: PASS"
         else:
             yield f"\nReview: NEEDS IMPROVEMENT - {review_data.get('feedback', '')}"
 
+        while self._can_retry_review(review_data, review_attempts):
+            yield f"\n\n[Planner] Replanning (attempt {review_attempts})...\n\n"
+            retry_context = self._build_review_context(
+                feedback=review_data.get("feedback", ""),
+                suggestions=review_data.get("suggestions", []),
+                attempt=review_attempts,
+                result_text=result_text
+            )
+            current_plan = await self.planner.run(
+                user_input,
+                context_summary=self._compose_context_summary(retry_context)
+            )
+            self._update_checkpoint(checkpoint, stage="planned", plan=self._plan_to_dict(current_plan))
+            yield current_plan.analysis
+
+            if not current_plan.actions or all(
+                a.get("tool") in ["direct_response", "none", ""] for a in current_plan.actions
+            ):
+                result_text = current_plan.analysis
+                current_confirmed_actions = {
+                    "analysis": current_plan.analysis,
+                    "actions": [],
+                    "reasoning": current_plan.reasoning
+                }
+                self._update_checkpoint(
+                    checkpoint,
+                    stage="executed",
+                    result=result_text,
+                    confirmed_actions=current_confirmed_actions
+                )
+            else:
+                yield "\n\n[Safety] Checking permissions...\n\n"
+                current_confirmed_actions = await self._safety_check(current_plan)
+                if not current_confirmed_actions:
+                    blocked_message = "Task blocked by security protocol"
+                    yield f"\n{blocked_message}\n"
+                    self._record_interaction(user_input, blocked_message)
+                    self._finalize_checkpoint(checkpoint, blocked_message)
+                    return
+                self._update_checkpoint(checkpoint, stage="confirmed", confirmed_actions=current_confirmed_actions)
+
+                anomaly_block = self._check_anomaly_block(current_confirmed_actions)
+                if anomaly_block:
+                    yield f"\n{anomaly_block}\n"
+                    self._record_interaction(user_input, anomaly_block)
+                    self._finalize_checkpoint(checkpoint, anomaly_block)
+                    return
+
+                yield "[Executor] Running...\n\n"
+                result_text = ""
+                first_chunk = True
+                async for chunk in self.executor.stream(current_confirmed_actions):
+                    if first_chunk:
+                        first_chunk = False
+                        continue
+                    result_text += chunk
+                    yield chunk
+                self._update_checkpoint(checkpoint, stage="executed", result=result_text)
+
+            yield "\n\n[Reviewer] Checking...\n\n"
+            review = await self.reviewer.run(result_text)
+            review_data = {
+                "passed": review.passed,
+                "feedback": review.feedback,
+                "suggestions": review.suggestions
+            }
+            review_attempts += 1
+            review_history = self._record_review(checkpoint, review_data, review_attempts)
+
+            if review_data.get("passed"):
+                yield "\nReview: PASS"
+            else:
+                yield f"\nReview: NEEDS IMPROVEMENT - {review_data.get('feedback', '')}"
+
         if self.enable_experience and self.experience_store:
             await self.experience_store.record(
                 task=user_input,
-                plan={"analysis": plan.analysis, "actions": confirmed_actions.get("actions", [])},
+                plan={
+                    "analysis": current_plan.analysis,
+                    "actions": (current_confirmed_actions or {}).get("actions", [])
+                },
                 result=result_text,
                 review_passed=review_data.get("passed", False),
                 review_feedback=review_data.get("feedback", ""),
