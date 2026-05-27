@@ -113,7 +113,7 @@ async def main_loop():
     provider = os.getenv("DEFAULT_PROVIDER", "openai")
     model = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
     orchestrator = SafeOrchestrator(provider_name=provider, model_name=model)
-    memory = MemorySystem(WORKSPACE_DIR)
+    memory = MemorySystem(MEMORY_DIR)
 
     console.print("[dim]Tip: Type 'help' for commands[/dim]\n")
 

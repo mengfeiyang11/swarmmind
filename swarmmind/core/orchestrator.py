@@ -23,7 +23,7 @@ from rich.panel import Panel
 from .memory import MemorySystem
 from .logger import audit_logger
 from .security import SafetyChecker, ConfirmProtocol
-from .config import MEMORY_DIR
+from .config import MEMORY_DIR, WORKSPACE_DIR, WORKSPACE_OFFICE_DIR, PROJECT_ROOT
 from .experience import ExperienceStore
 from .anomaly import BehaviorMonitor, AnomalySeverity, RecommendedAction
 from .compressor import ContextCompressor
@@ -82,6 +82,7 @@ class SafeOrchestrator:
         self.planner = PlannerAgent(provider_name, model_name, self.experience_store)
         self.executor = ExecutorAgent(provider_name, model_name)
         self.reviewer = ReviewerAgent(provider_name, model_name)
+        self.memory.set_llm(self.planner.llm)
 
         self.summary = ""
         self._conversation_messages: List[BaseMessage] = []
@@ -1053,6 +1054,8 @@ class SafeOrchestrator:
         self._conversation_messages.append(HumanMessage(content=user_input))
         self._conversation_messages.append(AIMessage(content=result_text))
 
+        self._update_user_profile(user_input, result_text)
+
         if not self._compressor.needs_compression(self._conversation_messages):
             return
 
@@ -1067,6 +1070,24 @@ class SafeOrchestrator:
         self._conversation_messages = [
             msg for msg in compressed if not isinstance(msg, SystemMessage)
         ]
+
+    def _update_user_profile(self, user_input: str, result_text: str) -> None:
+        context = {
+            "workspace_dir": WORKSPACE_DIR,
+            "office_dir": WORKSPACE_OFFICE_DIR,
+            "project_root": PROJECT_ROOT,
+            "summary": self.summary
+        }
+        try:
+            self.memory.update_user_profile(user_input, result_text, context=context)
+        except Exception as e:
+            audit_logger.log_event(
+                thread_id="orchestrator",
+                event="profile_update_failed",
+                agent_name="orchestrator",
+                risk_level="low",
+                error=str(e)[:200]
+            )
 
     @staticmethod
     def _extract_summary(messages: List[BaseMessage]) -> str:

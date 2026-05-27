@@ -125,6 +125,10 @@ ANTHROPIC_API_KEY=sk-ant-xxx
 
 # Ollama 本地模型 (可选)
 OLLAMA_BASE_URL=http://localhost:11434
+
+# 用户画像 (可选)
+SWARMIND_AUTO_PROFILE_UPDATE=true
+SWARMIND_PROFILE_MAX_CHARS=4000
 ```
 
 ### 3. 运行

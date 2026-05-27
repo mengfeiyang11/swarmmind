@@ -13,6 +13,10 @@ PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
 
 WORKSPACE_DIR = os.getenv("SWARMIND_WORKSPACE", os.path.join(PROJECT_ROOT, "workspace"))
 
+# 用户画像自动更新
+AUTO_PROFILE_UPDATE = os.getenv("SWARMIND_AUTO_PROFILE_UPDATE", "true").lower() in {"1", "true", "yes", "y"}
+PROFILE_MAX_CHARS = int(os.getenv("SWARMIND_PROFILE_MAX_CHARS", "4000"))
+
 # 数据库路径
 DB_PATH = os.path.join(WORKSPACE_DIR, "state.sqlite3")
 
